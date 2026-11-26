@@ -76,10 +76,10 @@ With the `ADMIN_TOKEN` secret set, `Authorization: Bearer <ADMIN_TOKEN>`:
 
 `wrangler.toml` vars: `APRON_URL` (default `wss://server.apron.chat/`), `MODEL`
 (default `anthropic/claude-sonnet-5.5` on OpenRouter), `OWNER_IDS`,
-`IDLE_SECONDS`, `KEEPALIVE`, `PUSH_ENDPOINT` (all optional).
+`IDLE_SECONDS`, `KEEPALIVE` (all optional).
 
 Secrets: `APRON_TOKEN` (from `/invite-bot`), `OPENROUTER_API_KEY`, `ADMIN_TOKEN`,
-`PUSH_SECRET` (with push).
+`PUSH_SECRET` and `PUSH_ENDPOINT` (with push; the endpoint is a secret because its forward ID is).
 
 Web search uses OpenRouter's `openrouter:web_search` server tool; `fetch_url`
 runs in the Worker.

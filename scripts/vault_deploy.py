@@ -22,7 +22,7 @@ import tomllib
 import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SECRETS = ["APRON_TOKEN", "OPENROUTER_API_KEY", "ADMIN_TOKEN", "PUSH_SECRET"]
+SECRETS = ["APRON_TOKEN", "OPENROUTER_API_KEY", "ADMIN_TOKEN", "PUSH_SECRET", "PUSH_ENDPOINT"]
 
 
 def vault(skill: str, method: str, url: str, body: str | None = None, content_type: str | None = None, hint: str = "") -> dict:
@@ -50,21 +50,24 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--account", required=True)
     ap.add_argument("--vault-skill", required=True)
+    ap.add_argument("--config", default=os.path.join(ROOT, "wrangler.toml"), help="wrangler.toml of the Worker to deploy")
+    ap.add_argument("--bundle", default=os.path.join(ROOT, "dist", "index.js"), help="bundled module (wrangler deploy --dry-run --outdir)")
+    ap.add_argument("--secret", action="append", default=[], help="NAME of an env var to set as a secret (repeatable)")
     ap.add_argument("--deployed-tag", default="", help="migration tag already deployed (empty for a first deploy)")
     args = ap.parse_args()
 
-    with open(os.path.join(ROOT, "wrangler.toml"), "rb") as f:
+    with open(args.config, "rb") as f:
         cfg = tomllib.load(f)
     name = cfg["name"]
     api = f"https://api.cloudflare.com/client/v4/accounts/{args.account}/workers/scripts/{name}"
 
-    with open(os.path.join(ROOT, "dist", "index.js"), "rb") as f:
+    with open(args.bundle, "rb") as f:
         script = f.read()
 
     bindings = [{"type": "durable_object_namespace", "name": b["name"], "class_name": b["class_name"]} for b in cfg["durable_objects"]["bindings"]]
     bindings += [{"type": "plain_text", "name": k, "text": v} for k, v in cfg.get("vars", {}).items()]
     keep = []
-    for s in SECRETS:
+    for s in SECRETS + [x for x in args.secret if x not in SECRETS]:
         if os.environ.get(s):
             bindings.append({"type": "secret_text", "name": s, "text": os.environ[s]})
         else:
@@ -100,11 +103,13 @@ def main() -> None:
     ]
     body = base64.b64encode(b"".join(parts)).decode()
 
-    print(f"Uploading {name} ({len(script)} bytes); secrets set: {[s for s in SECRETS if s not in keep]}, kept: {keep}")
+    print(f"Uploading {name} ({len(script)} bytes); secrets set: {[b['name'] for b in bindings if b['type'] == 'secret_text']}")
     res = vault(args.vault_skill, "PUT", api, body, f"multipart/form-data; boundary={boundary}", f"Deploy Worker {name} (chat-agent Apron bot)")
     print("uploaded:", res["result"].get("id"), res["result"].get("modified_on"))
 
     crons = cfg.get("triggers", {}).get("crons", [])
+    if not crons and not cfg.get("workers_dev", True):
+        return
     vault(args.vault_skill, "PUT", f"{api}/schedules", json.dumps([{"cron": c} for c in crons]), "application/json", f"Set cron for {name}")
     print("schedules:", crons)
 
