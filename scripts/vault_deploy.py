@@ -4,7 +4,8 @@
 Usage:
   npm run build
   APRON_TOKEN=... OPENROUTER_API_KEY=... ADMIN_TOKEN=... \
-    python3 scripts/vault_deploy.py --account <account_id> --vault-skill <path to skills/stupid-vault>
+    python3 scripts/vault_deploy.py --account <account_id> --vault-skill <path to skills/stupid-vault> \
+      [--deployed-tag v1]   # on redeploys: the migration tag already applied
 
 Secrets are optional on redeploys: any of APRON_TOKEN, OPENROUTER_API_KEY,
 ADMIN_TOKEN left unset keeps the Worker's existing value. Each Cloudflare API
@@ -49,6 +50,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--account", required=True)
     ap.add_argument("--vault-skill", required=True)
+    ap.add_argument("--deployed-tag", default="", help="migration tag already deployed (empty for a first deploy)")
     args = ap.parse_args()
 
     with open(os.path.join(ROOT, "wrangler.toml"), "rb") as f:
@@ -75,11 +77,16 @@ def main() -> None:
         "keep_bindings": ["secret_text"] if keep else [],
         "observability": {"enabled": True},
     }
-    tags = [m["tag"] for m in cfg.get("migrations", [])]
-    if tags:
-        # Cloudflare skips migrations already applied (by old_tag/new_tag).
-        steps = [{k: v for k, v in m.items() if k != "tag"} for m in cfg["migrations"]]
-        metadata["migrations"] = {"new_tag": tags[-1], "steps": steps}
+    migrations = cfg.get("migrations", [])
+    tags = [m["tag"] for m in migrations]
+    if args.deployed_tag and args.deployed_tag not in tags:
+        sys.exit(f"--deployed-tag {args.deployed_tag} is not in wrangler.toml's migrations")
+    pending = migrations[tags.index(args.deployed_tag) + 1 :] if args.deployed_tag else migrations
+    if pending:
+        steps = [{k: v for k, v in m.items() if k != "tag"} for m in pending]
+        metadata["migrations"] = {"new_tag": pending[-1]["tag"], "steps": steps}
+        if args.deployed_tag:
+            metadata["migrations"]["old_tag"] = args.deployed_tag
 
     boundary = f"----chatagent{uuid.uuid4().hex}"
     parts = [

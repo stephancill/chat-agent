@@ -113,4 +113,5 @@ APRON_TOKEN=… OPENROUTER_API_KEY=… ADMIN_TOKEN=… \
   python3 scripts/vault_deploy.py --account <account_id> --vault-skill <stupid-vault>/skills/stupid-vault
 ```
 
-Secrets left unset keep their deployed values.
+Secrets left unset keep their deployed values. On redeploys pass
+`--deployed-tag <last applied migration tag>` (currently `v1`).
