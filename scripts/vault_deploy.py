@@ -39,9 +39,9 @@ def vault(skill: str, method: str, url: str, body: str | None = None, content_ty
     try:
         data = json.loads(out.stdout)
     except json.JSONDecodeError:
-        sys.exit(f"unexpected response: {out.stdout[:500]}")
+        sys.exit(f"unexpected response: {out.stdout[:500]}\n{out.stderr.strip()[-500:]}")
     if not data.get("success", False):
-        sys.exit(f"Cloudflare API error: {json.dumps(data.get('errors'))}")
+        sys.exit(f"Cloudflare API error: {json.dumps(data)[:2000]}\n{out.stderr.strip()[-500:]}")
     return data
 
 
