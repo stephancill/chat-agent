@@ -13,6 +13,10 @@ export interface Env {
   ADMIN_TOKEN?: string; // secret; enables /admin/*
   MODEL?: string;
   OWNER_IDS?: string; // comma-separated; default: derived from bot_<owner>
+  KEEPALIVE?: string; // "true": stay connected instead of sleeping when idle
+  IDLE_SECONDS?: string; // how long to stay connected after activity (default 180)
+  PUSH_ENDPOINT?: string; // Web Push endpoint that forwards to /push/<PUSH_SECRET>
+  PUSH_SECRET?: string; // secret path segment for /push/<PUSH_SECRET>
 }
 
 const AGENT = "chat-agent/0.1";
@@ -39,6 +43,7 @@ interface Persisted {
   halted?: string | null;
   costUsd?: number;
   answered?: number;
+  pushKeys?: { p256dh: string; auth: string };
 }
 
 type Pending = { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -62,11 +67,14 @@ export class ApronBot extends DurableObject<Env> {
   private handled = new Set<string>();
   private loaded: Promise<void>;
   private log: string[] = [];
+  private lingerUntil = 0;
+  private lastPingAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.loaded = ctx.blockConcurrencyWhile(async () => {
       this.state = (await ctx.storage.get<Persisted>("state")) ?? {};
+      this.log = (await ctx.storage.get<string[]>("log")) ?? [];
       this.sent = new Set(this.state.sent ?? []);
       this.handled = new Set(this.state.handled ?? []);
     });
@@ -87,6 +95,7 @@ export class ApronBot extends DurableObject<Env> {
     console.log(entry);
     this.log.push(entry);
     if (this.log.length > 100) this.log.shift();
+    this.ctx.storage.put("log", this.log).catch(() => {});
   }
 
   private secrets(): string[] {
@@ -103,22 +112,85 @@ export class ApronBot extends DurableObject<Env> {
   }
 
   // ---------- lifecycle ----------
+  //
+  // An outbound WebSocket keeps the Durable Object awake (and billed), so by
+  // default the bot sleeps: it connects when woken (cron poll, a push POST
+  // from the Apron server, an admin call), catches up from its checkpoint,
+  // answers, stays connected while people are talking to it, then closes the
+  // socket and lets its alarm lapse. KEEPALIVE=true keeps it connected.
 
-  /** Starts the connection if it should be running. Called by cron, fetch, and alarm. */
-  async ensure(): Promise<void> {
+  private keepAlive(): boolean {
+    return /^(1|true|yes)$/i.test(this.env.KEEPALIVE ?? "");
+  }
+
+  private idleMs(): number {
+    const n = Number(this.env.IDLE_SECONDS);
+    return (Number.isFinite(n) && n >= 0 ? n : 180) * 1000;
+  }
+
+  /** Stay connected at least `ms` from now. */
+  private linger(ms: number): void {
+    this.lingerUntil = Math.max(this.lingerUntil, Date.now() + ms);
+  }
+
+  private busy(): boolean {
+    return this.running > 0 || this.jobs.length > 0 || this.connecting;
+  }
+
+  /**
+   * Wakes the bot. `poll` (cron) only catches up and goes back to sleep;
+   * `push` and `admin` also stay connected for a while for follow-ups.
+   */
+  async wake(reason: "poll" | "push" | "admin"): Promise<void> {
     await this.loaded;
     if (this.state.paused || this.state.halted) return;
-    if (!this.ws && !this.connecting) {
+    if (reason !== "poll") {
+      this.linger(this.idleMs());
+      this.note(`woken (${reason})`);
+    }
+    if (this.ws && !this.connecting) {
+      // Already connected: a push means something new; catch up in case the
+      // live delivery raced the wake.
+      if (reason === "push") await this.catchUp().catch((e) => this.note(`catch-up failed: ${(e as Error).message}`));
+    } else if (!this.connecting) {
       try {
         await this.openSocket();
       } catch (e) {
-        this.note(`connect failed: ${(e as Error).message}`);
+        this.note(`connect failed (${reason}): ${(e as Error).message}`);
         this.dropSocket();
-        await this.scheduleReconnect();
+        if (this.wantsConnection()) await this.scheduleReconnect();
         return;
       }
     }
-    if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 45_000);
+    await this.settle();
+  }
+
+  /** Whether the bot should be connected right now. */
+  private wantsConnection(): boolean {
+    if (this.state.paused || this.state.halted) return false;
+    return this.keepAlive() || this.busy() || Date.now() < this.lingerUntil;
+  }
+
+  /** The next alarm: the next ping, or the end of the idle period if sooner. */
+  private async tick(): Promise<void> {
+    let at = Date.now() + 45_000;
+    if (!this.keepAlive() && !this.busy() && this.lingerUntil > Date.now()) at = Math.min(at, this.lingerUntil + 1_000);
+    await this.ctx.storage.setAlarm(at);
+  }
+
+  /** Closes the socket if nothing needs it, else keeps the ping alarm going. */
+  private async settle(): Promise<void> {
+    if (!this.ws) return;
+    if (this.wantsConnection()) {
+      await this.tick();
+      return;
+    }
+    this.note("idle; disconnecting");
+    try {
+      this.ws.close(1000, "idle");
+    } catch {}
+    this.dropSocket();
+    await this.ctx.storage.deleteAlarm();
   }
 
   async alarm(): Promise<void> {
@@ -126,28 +198,37 @@ export class ApronBot extends DurableObject<Env> {
     if (this.state.paused || this.state.halted) return;
     if (this.ws) {
       if (Date.now() - this.lastFrameAt > STALE_MS) {
-        this.note("connection stale; reconnecting");
+        this.note("connection stale");
         try {
           this.ws.close(1000, "stale");
         } catch {}
         this.dropSocket();
+      } else if (this.wantsConnection()) {
+        // Ping on the 45s cadence; an earlier idle-check alarm just reschedules.
+        if (Date.now() - this.lastPingAt >= 40_000) {
+          try {
+            this.ws.send(PING);
+            this.lastPingAt = Date.now();
+          } catch {}
+        }
+        await this.tick();
+        return;
       } else {
-        try {
-          this.ws.send(PING);
-        } catch {}
-      }
-    }
-    if (!this.ws && !this.connecting) {
-      try {
-        await this.openSocket();
-      } catch (e) {
-        this.note(`connect failed: ${(e as Error).message}`);
-        this.dropSocket();
-        await this.scheduleReconnect();
+        await this.settle();
         return;
       }
     }
-    await this.ctx.storage.setAlarm(Date.now() + 45_000);
+    // Not connected: a reconnect after a drop or failure, if still wanted.
+    if (!this.wantsConnection() || this.connecting) return;
+    try {
+      await this.openSocket();
+    } catch (e) {
+      this.note(`connect failed: ${(e as Error).message}`);
+      this.dropSocket();
+      await this.scheduleReconnect();
+      return;
+    }
+    await this.settle();
   }
 
   private async scheduleReconnect(minSeconds = 0): Promise<void> {
@@ -163,7 +244,10 @@ export class ApronBot extends DurableObject<Env> {
       const url = this.env.APRON_URL.replace(/^ws(s?):/, "http$1:");
       const res = await fetch(url, { headers: { Upgrade: "websocket" } });
       const ws = res.webSocket;
-      if (!ws) throw new Error(`server did not accept the WebSocket (HTTP ${res.status})`);
+      if (!ws) {
+        const detail = (await res.text().catch(() => "")).slice(0, 200);
+        throw new Error(`server did not accept the WebSocket (HTTP ${res.status}${detail ? `: ${detail}` : ""})`);
+      }
       ws.accept();
       this.ws = ws;
       this.lastFrameAt = Date.now();
@@ -191,18 +275,47 @@ export class ApronBot extends DurableObject<Env> {
       const auth = await this.request("auth", { scheme: "token", token: this.env.APRON_TOKEN, agent: AGENT });
       if (!auth?.you) throw new Error("auth returned no identity");
       this.me = auth.you;
-      this.note(`signed in as ${this.me!.user_id}`);
       this.attempts = 0;
       ws.send(PING);
+      this.lastPingAt = Date.now();
 
       const listing = await this.request("room_list", { filter: "joined" });
       for (const room of listing?.joined ?? []) this.rooms.set(room.room_id, room.title);
+      await this.registerPush();
       await this.catchUp();
     } catch (e) {
       if (e instanceof RequestError && e.code === ERR.denied) await this.halt(`auth denied: ${e.message}`);
       throw e;
     } finally {
       this.connecting = false;
+    }
+  }
+
+  /**
+   * Registers a Web Push subscription whose endpoint wakes this Worker
+   * (PUSH_ENDPOINT, which must be on a push host the server allows). The
+   * payload is never decrypted: any POST just means "catch up". Registrations
+   * lapse after a week, so this runs on every connection.
+   */
+  private async registerPush(): Promise<void> {
+    const url = this.env.PUSH_ENDPOINT;
+    if (!url) return;
+    try {
+      if (!this.state.pushKeys) {
+        const pair = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])) as CryptoKeyPair;
+        const raw = (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer;
+        this.state.pushKeys = { p256dh: b64url(new Uint8Array(raw)), auth: b64url(crypto.getRandomValues(new Uint8Array(16))) };
+        await this.save();
+      }
+      await this.request("push_register", {
+        kind: "webpush",
+        url,
+        keys: this.state.pushKeys,
+        push_id: "chat-agent",
+        wake: ["mentions", "replies", "private"],
+      });
+    } catch (e) {
+      this.note(`push_register failed: ${(e as Error).message}`);
     }
   }
 
@@ -224,8 +337,7 @@ export class ApronBot extends DurableObject<Env> {
       await this.halt(`closed ${code}: ${reason}`);
       return;
     }
-    if (this.state.paused || this.state.halted) return;
-    await this.scheduleReconnect(code === 1013 ? 60 : 0);
+    if (this.wantsConnection()) await this.scheduleReconnect(code === 1013 ? 60 : 0);
   }
 
   private async halt(reason: string): Promise<void> {
@@ -390,6 +502,7 @@ export class ApronBot extends DurableObject<Env> {
     if (live && this.isAuthorized(msg.from.user_id)) {
       this.request("reactions", { message_id: msg.message_id, emojis: ["👀"] }).catch(() => {});
     }
+    this.linger(this.idleMs());
     this.jobs.push(msg);
     this.drain();
 
@@ -413,6 +526,8 @@ export class ApronBot extends DurableObject<Env> {
           .finally(() => {
             this.running--;
             this.drain();
+            this.linger(this.idleMs());
+            this.settle().catch(() => {});
           }),
       );
     }
@@ -583,12 +698,16 @@ export class ApronBot extends DurableObject<Env> {
     const path = url.pathname.replace(/^\/admin/, "");
     switch (`${request.method} ${path}`) {
       case "GET /health":
-        await this.ensure();
         return json({ connected: !!this.ws && !!this.me, halted: !!this.state.halted, paused: !!this.state.paused });
+      case "POST /wake":
+        await this.wake("admin");
+        return json({ connected: !!this.ws });
       case "GET /status":
-        await this.ensure();
         return json({
           connected: !!this.ws,
+          mode: this.keepAlive() ? "keepalive" : "sleep when idle",
+          lingerUntil: this.lingerUntil > Date.now() ? new Date(this.lingerUntil).toISOString() : null,
+          push: this.env.PUSH_ENDPOINT ? "registered on each connection" : "off (set PUSH_ENDPOINT)",
           me: this.me,
           owners: [...this.owners()],
           allow: this.state.allow ?? [],
@@ -628,8 +747,8 @@ export class ApronBot extends DurableObject<Env> {
         this.state.halted = null;
         this.attempts = 0;
         await this.save();
-        await this.ensure();
-        return json({ resumed: true });
+        await this.wake("admin");
+        return json({ resumed: true, connected: !!this.ws });
       default:
         return json({ error: "not found" }, 404);
     }
@@ -638,6 +757,12 @@ export class ApronBot extends DurableObject<Env> {
 
 function who(u: User): string {
   return u.name && u.name !== u.user_id ? `${u.name} (@${u.user_id})` : `@${u.user_id}`;
+}
+
+function b64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
 function clip(s: string, n: number): string {

@@ -2,8 +2,27 @@
 
 An [Apron](https://apron.chat/protocol) chat bot you `@mention` with a question.
 It searches the web, reads pages, and replies in a thread to your message, with
-sources. Runs on Cloudflare Workers: one Durable Object holds a single WebSocket
-to the Apron server.
+sources. Runs on Cloudflare Workers: one Durable Object holds the bot's single
+WebSocket to the Apron server.
+
+## Sleeping when idle
+
+Durable Objects only hibernate on WebSockets they *receive*; an outbound socket
+keeps the object awake and billed. So by default the bot sleeps:
+
+- **Wake** on the cron poll (every 2 minutes), on a Web Push POST to
+  `/push/<PUSH_SECRET>`, or on `POST /admin/wake`.
+- On waking it connects, catches up from its last log position (answering
+  mentions under 15 minutes old), and answers.
+- It stays connected for `IDLE_SECONDS` (default 180) after the last mention or
+  answer, so follow-ups are instant, then closes the socket and lets its alarm
+  lapse.
+- **Push** (optional): set `PUSH_ENDPOINT` to a Web Push endpoint on a host the
+  Apron server allows that forwards POSTs to `/push/<PUSH_SECRET>`. The bot
+  registers it on every connection (`push_register`, waking on mentions,
+  replies and private rooms) and never decrypts the payload. The server waits
+  30 seconds before pushing. Without push, answers take up to one poll interval.
+- `KEEPALIVE=true` keeps it connected all the time instead.
 
 ## Using it
 
@@ -36,13 +55,14 @@ With the `ADMIN_TOKEN` secret set, `Authorization: Bearer <ADMIN_TOKEN>`:
 
 - `GET /admin/status` — connection, allowlist, rooms, spend, recent log
 - `POST /admin/allow?user=<id>` / `POST /admin/deny?user=<id>` (`user=*` for everyone)
+- `POST /admin/wake` — connect now and stay for `IDLE_SECONDS`
 - `POST /admin/pause` (kill switch) / `POST /admin/resume` (also clears a halt after a token problem)
 
 `GET /health` is public.
 
 ## Behaviour
 
-- Pings at the server's interval; reconnects with backoff; a denied sign-in or a
+- While connected, pings at the server's interval and reconnects with backoff; a denied sign-in or a
   "token replaced" close halts it until `/admin/resume`.
 - On reconnect it catches up from its last log position and answers mentions
   under 15 minutes old. Each message is answered once (dedup by message ID, and
@@ -55,9 +75,11 @@ With the `ADMIN_TOKEN` secret set, `Authorization: Bearer <ADMIN_TOKEN>`:
 ## Configuration
 
 `wrangler.toml` vars: `APRON_URL` (default `wss://server.apron.chat/`), `MODEL`
-(default `anthropic/claude-sonnet-5.5` on OpenRouter), `OWNER_IDS` (optional).
+(default `anthropic/claude-sonnet-5.5` on OpenRouter), `OWNER_IDS`,
+`IDLE_SECONDS`, `KEEPALIVE`, `PUSH_ENDPOINT` (all optional).
 
-Secrets: `APRON_TOKEN` (from `/invite-bot`), `OPENROUTER_API_KEY`, `ADMIN_TOKEN`.
+Secrets: `APRON_TOKEN` (from `/invite-bot`), `OPENROUTER_API_KEY`, `ADMIN_TOKEN`,
+`PUSH_SECRET` (with push).
 
 Web search uses OpenRouter's `openrouter:web_search` server tool; `fetch_url`
 runs in the Worker.

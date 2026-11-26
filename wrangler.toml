@@ -18,7 +18,7 @@ tag = "v1"
 new_sqlite_classes = ["ApronBot"]
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/2 * * * *"]
 
 [observability]
 enabled = true

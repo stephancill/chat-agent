@@ -21,7 +21,7 @@ import tomllib
 import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SECRETS = ["APRON_TOKEN", "OPENROUTER_API_KEY", "ADMIN_TOKEN"]
+SECRETS = ["APRON_TOKEN", "OPENROUTER_API_KEY", "ADMIN_TOKEN", "PUSH_SECRET"]
 
 
 def vault(skill: str, method: str, url: str, body: str | None = None, content_type: str | None = None, hint: str = "") -> dict:
