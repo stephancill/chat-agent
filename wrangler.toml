@@ -1,0 +1,24 @@
+name = "apron-search-bot"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+[vars]
+APRON_URL = "wss://server.apron.chat/"
+MODEL = "anthropic/claude-sonnet-5.5"
+# OWNER_IDS = "stephancill_2586"  # default: derived from the bot's user_id (bot_<owner>)
+
+# Secrets (wrangler secret put …): APRON_TOKEN, OPENROUTER_API_KEY, ADMIN_TOKEN
+
+[[durable_objects.bindings]]
+name = "APRON_BOT"
+class_name = "ApronBot"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ApronBot"]
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true
